@@ -101,6 +101,16 @@ class RemoteConnection:
                 # Create socket
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                
+                # Platform-specific TCP keepalive tuning for fast crash detection
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)  # Start after 60s
+                if hasattr(socket, 'TCP_KEEPINTVL'):
+                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)  # Every 10s
+                if hasattr(socket, 'TCP_KEEPCNT'):
+                    self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)  # 3 attempts
+                
                 self.socket.settimeout(self.timeout)
                 
                 # Connect
@@ -125,6 +135,11 @@ class RemoteConnection:
                         logger.error(f"Failed to send magic keyword to {target}: {e}")
                         # Continue anyway, connection is established
 
+                # Wait for previous receive thread to exit if needed
+                if self._receive_thread and self._receive_thread.is_alive():
+                    logger.debug(f"Waiting for previous receive thread to exit for {target}")
+                    self._receive_thread.join(timeout=2.0)
+                
                 # Start receive thread
                 self._receive_thread = threading.Thread(
                     target=self._receive_loop, 
@@ -161,15 +176,19 @@ class RemoteConnection:
         """Main receive loop - runs in separate thread"""
         target = f"{self.host}:{self.port}"
         logger.debug(f"Receive loop started for {target}")
+        consecutive_recv_timeouts = 0
         
         try:
-            while self.running and self.connected:
-                # Check for forced reconnect
-                if self._force_reconnect:
-                    logger.info(f"Force reconnect requested for {target}")
-                    break
+            while True:
+                # Check connection state under lock
+                with self._lock:
+                    if not self.running or not self.connected:
+                        break
+                    if self._force_reconnect:
+                        logger.info(f"Force reconnect requested for {target}")
+                        break
                 
-                # Check keepalive timeout
+                # Check keepalive timeout at start of each iteration
                 idle_time = time.time() - self._last_receive_time
                 if idle_time > self.keepalive_timeout:
                     logger.warning(f"Keepalive timeout ({idle_time:.0f}s > {self.keepalive_timeout}s) for {target}")
@@ -177,17 +196,23 @@ class RemoteConnection:
                     break
 
                 try:
-                    # Non-blocking receive with timeout
+                    # Receive with timeout (short timeout for faster disconnection detection)
                     data = self.socket.recv(self.buffer_size)
                     
                     if not data:
-                        # Remote closed connection
+                        # Remote closed connection (empty recv = FIN from peer)
                         logger.info(f"Remote closed connection: {target}")
                         self._handle_disconnect(ConnectionError("Remote closed connection"))
                         break
                     
+                    # Data received successfully - reset timeout counter
+                    consecutive_recv_timeouts = 0
+                    
                     # Update last receive time
                     self._last_receive_time = time.time()
+                    
+                    # Log data received for debugging
+                    logger.debug(f"Received {len(data)} bytes from {target}")
                     
                     # Call message callback
                     if self.on_message:
@@ -197,7 +222,17 @@ class RemoteConnection:
                             logger.error(f"Error in on_message callback: {e}", exc_info=True)
                 
                 except socket.timeout:
-                    # Timeout is normal, just continue
+                    # Socket timeout is expected - but too many consecutive ones indicate stale connection
+                    consecutive_recv_timeouts += 1
+                    
+                    # 5 consecutive timeouts = 5+ seconds with no data AND no keepalive response
+                    # Combined with keepalive_timeout (300s), this catches hung connections earlier
+                    if consecutive_recv_timeouts > 5:
+                        idle = time.time() - self._last_receive_time
+                        logger.warning(f"Stale connection detected for {target} ({idle:.0f}s idle, {consecutive_recv_timeouts} timeouts)")
+                        # Don't disconnect yet, let keepalive_timeout handle it
+                        consecutive_recv_timeouts = 0  # Reset counter to avoid spam
+                    
                     continue
                 
                 except (ConnectionResetError, BrokenPipeError, OSError) as e:
@@ -279,7 +314,16 @@ class RemoteConnection:
         try:
             while self.auto_reconnect and not self.connected:
                 logger.info(f"Reconnecting to {target} in {delay:.1f}s...")
-                time.sleep(delay)
+                # Sleep in small increments to be responsive to shutdown
+                remaining = delay
+                while remaining > 0 and self.auto_reconnect and not self.connected:
+                    sleep_time = min(remaining, 1.0)
+                    time.sleep(sleep_time)
+                    remaining -= sleep_time
+                
+                # Check again in case auto_reconnect was disabled during sleep
+                if not self.auto_reconnect or self.connected:
+                    break
                 
                 # Try to connect
                 if self.connect():
@@ -328,35 +372,43 @@ class RemoteConnection:
             if not self.connected:
                 # Not connected, just try to connect
                 logger.debug("Not connected, triggering connect")
-                self.connect()
-                return
-            
-            # Set flag to break out of receive loop
-            self._force_reconnect = True
-            self.running = False
-            
-            # Close socket to unblock recv()
-            if self.socket:
-                try:
-                    self.socket.shutdown(socket.SHUT_RDWR)
-                except:
-                    pass
-                try:
-                    self.socket.close()
-                except:
-                    pass
-                self.socket = None
-            
-            self.connected = False
+                # Unlock before calling connect since it will try to acquire the lock
+                pass  # Will call connect outside lock below
+            else:
+                # Set flag to break out of receive loop
+                self._force_reconnect = True
+                self.running = False
+                
+                # Close socket to unblock recv()
+                if self.socket:
+                    try:
+                        self.socket.shutdown(socket.SHUT_RDWR)
+                    except:
+                        pass
+                    try:
+                        self.socket.close()
+                    except:
+                        pass
+                    self.socket = None
+                
+                self.connected = False
         
-        # Wait briefly for receive thread to exit
+        # Wait for receive thread to exit (outside lock)
         if self._receive_thread and self._receive_thread.is_alive():
-            self._receive_thread.join(timeout=2.0)
+            logger.debug(f"Waiting for receive thread to exit for {self.host}:{self.port}")
+            self._receive_thread.join(timeout=5.0)
+            if self._receive_thread.is_alive():
+                logger.warning(f"Receive thread did not exit cleanly for {self.host}:{self.port}")
         
-        # Trigger reconnect
+        # Trigger reconnect if auto-reconnect is enabled
         if self.auto_reconnect:
             time.sleep(1)  # Brief delay
-            self.connect()
+            if self.connect():
+                logger.info(f"Successfully reconnected after force_disconnect for {self.host}:{self.port}")
+            else:
+                logger.warning(f"Failed to reconnect after force_disconnect for {self.host}:{self.port}")
+        else:
+            logger.debug(f"Auto-reconnect disabled, not retrying connection for {self.host}:{self.port}")
 
     def disconnect(self, wait: bool = True):
         """
@@ -367,7 +419,7 @@ class RemoteConnection:
         """
         logger.info(f"Disconnecting from {self.host}:{self.port}")
         
-        # Disable auto-reconnect
+        # Disable auto-reconnect first
         self.auto_reconnect = False
         self.running = False
         
@@ -388,10 +440,19 @@ class RemoteConnection:
         
         # Wait for threads to exit
         if wait:
+            # Receive thread
             if self._receive_thread and self._receive_thread.is_alive():
-                self._receive_thread.join(timeout=5.0)
+                logger.debug(f"Waiting for receive thread to exit for {self.host}:{self.port}")
+                self._receive_thread.join(timeout=10.0)
+                if self._receive_thread.is_alive():
+                    logger.warning(f"Receive thread did not exit cleanly for {self.host}:{self.port}")
+            
+            # Reconnect thread
             if self._reconnect_thread and self._reconnect_thread.is_alive():
-                self._reconnect_thread.join(timeout=5.0)
+                logger.debug(f"Waiting for reconnect thread to exit for {self.host}:{self.port}")
+                self._reconnect_thread.join(timeout=10.0)
+                if self._reconnect_thread.is_alive():
+                    logger.warning(f"Reconnect thread did not exit cleanly for {self.host}:{self.port}")
         
         logger.debug(f"Disconnected from {self.host}:{self.port}")
 
