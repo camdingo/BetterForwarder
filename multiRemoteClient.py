@@ -37,25 +37,33 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StreamMetrics:
-    """Track metrics for a stream"""
+    """Track metrics for a stream - thread-safe access"""
     bytes_received: int = 0
     bytes_sent: int = 0
     messages_received: int = 0
     connect_time: Optional[float] = None
     last_data_time: Optional[float] = None
     reconnect_count: int = 0
+    _lock: threading.RLock = None
+    
+    def __post_init__(self):
+        """Initialize lock after dataclass creation"""
+        if self._lock is None:
+            object.__setattr__(self, '_lock', threading.RLock())
     
     def uptime(self) -> float:
         """Return uptime in seconds, or 0 if not connected"""
-        if self.connect_time:
-            return time.time() - self.connect_time
-        return 0.0
+        with self._lock:
+            if self.connect_time:
+                return time.time() - self.connect_time
+            return 0.0
     
     def time_since_data(self) -> Optional[float]:
         """Return seconds since last data, or None if no data yet"""
-        if self.last_data_time:
-            return time.time() - self.last_data_time
-        return None
+        with self._lock:
+            if self.last_data_time:
+                return time.time() - self.last_data_time
+            return None
 
 
 class ForwardingServer:
@@ -78,6 +86,8 @@ class ForwardingServer:
             self.server.listen(20)
             logger.info(f"[{self.name}] Forwarding server listening on 0.0.0.0:{self.port}")
             threading.Thread(target=self._accept, daemon=True, name=f"Accept-{self.name}").start()
+            # Start viewer health check thread
+            threading.Thread(target=self._check_viewer_health, daemon=True, name=f"HealthCheck-{self.name}").start()
         except OSError as e:
             logger.error(f"[{self.name}] Failed to bind port {self.port}: {e}")
             raise
@@ -85,9 +95,11 @@ class ForwardingServer:
     def _accept(self):
         """Accept new viewer connections"""
         self.server.settimeout(1.0)
+        consecutive_errors = 0
         while self.running:
             try:
                 client, addr = self.server.accept()
+                consecutive_errors = 0  # Reset error counter on success
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 
@@ -107,8 +119,15 @@ class ForwardingServer:
                 continue
             except Exception as e:
                 if self.running:
-                    logger.error(f"[{self.name}] Accept error: {e}")
-                break
+                    consecutive_errors += 1
+                    logger.error(f"[{self.name}] Accept error: {e} (attempt {consecutive_errors})")
+                    # Don't break on error - continue trying to accept connections
+                    if consecutive_errors > 10:
+                        logger.critical(f"[{self.name}] Too many accept errors, giving up")
+                        break
+                    time.sleep(0.1)  # Brief backoff to avoid rapid error loops
+                else:
+                    break
 
     def broadcast(self, data: bytes):
         """Broadcast data to all connected viewers"""
@@ -140,18 +159,81 @@ class ForwardingServer:
                     except:
                         pass
         
-        # Update metrics
-        if sent_count > 0:
-            self.metrics.bytes_sent += len(data) * sent_count
-        
-        # Always update bytes_received when we get data to broadcast
-        self.metrics.bytes_received += len(data)
-        self.metrics.messages_received += 1
+        # Update metrics - thread safe
+        with self.metrics._lock:
+            if sent_count > 0:
+                self.metrics.bytes_sent += len(data) * sent_count
+            # Always update bytes_received when we get data to broadcast
+            self.metrics.bytes_received += len(data)
+            self.metrics.messages_received += 1
+            # Log cumulative total for debugging
+            logger.debug(f"[{self.name}] RX: {len(data)} bytes (total: {self.metrics.bytes_received} bytes)")
 
     def viewer_count(self) -> int:
         """Return current number of connected viewers"""
         with self.lock:
             return len(self.clients)
+
+    def _check_viewer_health(self):
+        """Periodically check viewer connections for dead sockets"""
+        import select
+        while self.running:
+            time.sleep(5)  # Check every 5 seconds
+            if not self.running:
+                break
+            
+            dead = []
+            with self.lock:
+                clients_copy = list(self.clients)
+            
+            if not clients_copy:
+                continue
+            
+            # Use select to check for socket activity (closed connections or errors)
+            try:
+                # Set a small timeout for select
+                readable, _, exceptional = select.select(clients_copy, [], clients_copy, 0.5)
+                
+                # Readable sockets might have data OR be closed - check which
+                for c in readable:
+                    try:
+                        # Try to receive 1 byte - if connection is closed, get 0 bytes
+                        # Since select said readable, this won't block
+                        c.settimeout(0.1)  # Very short timeout just for this peek
+                        try:
+                            data = c.recv(1)
+                            if not data:
+                                # Empty recv = connection closed by peer
+                                dead.append(c)
+                                logger.info(f"[{self.name}] Detected closed viewer (FIN received)")
+                        finally:
+                            c.settimeout(2.0)  # Restore original timeout
+                    except socket.timeout:
+                        # This is OK - just means no data readily available
+                        pass
+                    except (OSError, socket.error):
+                        dead.append(c)
+                
+                # Check exceptional sockets (socket errors)
+                for c in exceptional:
+                    if c not in dead:
+                        dead.append(c)
+                        logger.info(f"[{self.name}] Detected viewer socket error")
+                
+            except Exception as e:
+                logger.debug(f"[{self.name}] Health check error: {e}")
+            
+            # Clean up dead connections
+            if dead:
+                with self.lock:
+                    for d in dead:
+                        if d in self.clients:
+                            self.clients.discard(d)
+                            try:
+                                d.close()
+                            except:
+                                pass
+                logger.info(f"[{self.name}] Cleaned up {len(dead)} dead viewer(s), {len(self.clients)} remaining")
 
     def stop(self):
         """Stop the forwarding server and disconnect all viewers"""
@@ -196,8 +278,9 @@ class StreamHandler:
         
     def _on_connect(self):
         """Called when connection is established"""
-        self.fwd.metrics.connect_time = time.time()
-        self.fwd.metrics.reconnect_count += 1
+        with self.fwd.metrics._lock:
+            self.fwd.metrics.connect_time = time.time()
+            self.fwd.metrics.reconnect_count += 1
         logger.info(f"[{self.name}] Connected to {self.config['remote_host']}:{self.config['remote_port']}")
         
         # Start watchdog if not already running
@@ -212,17 +295,23 @@ class StreamHandler:
     def _on_disconnect(self, exc: Exception):
         """Called when connection is lost"""
         logger.warning(f"[{self.name}] Disconnected: {exc}")
-        self.fwd.metrics.connect_time = None
+        with self.fwd.metrics._lock:
+            self.fwd.metrics.connect_time = None
     
     def _on_message(self, data: bytes):
         """Called when data is received"""
-        self.fwd.metrics.last_data_time = time.time()
+        with self.fwd.metrics._lock:
+            self.fwd.metrics.last_data_time = time.time()
         self.fwd.broadcast(data)
     
     def _watchdog(self):
         """Monitor for stale connections and force reconnect if needed"""
         while self.running:
-            time.sleep(60)  # Check every minute
+            # Sleep in small increments to be responsive to shutdown
+            for _ in range(10):  # Check every 10 seconds instead of 60
+                if not self.running:
+                    break
+                time.sleep(1)
             
             if not self.running:
                 break
@@ -240,6 +329,13 @@ class StreamHandler:
     def stop(self):
         """Stop the stream handler"""
         self.running = False
+        
+        # Wait for watchdog thread to exit
+        if self.watchdog_thread and self.watchdog_thread.is_alive():
+            logger.debug(f"[{self.name}] Waiting for watchdog thread to exit")
+            self.watchdog_thread.join(timeout=5.0)
+            if self.watchdog_thread.is_alive():
+                logger.warning(f"[{self.name}] Watchdog thread did not exit cleanly")
 
 
 def load_config(file="connections.ini") -> list:
@@ -264,6 +360,14 @@ def load_config(file="connections.ini") -> list:
             remote_port = cfg.getint(section, "remote_port")
             forward_port = cfg.getint(section, "forward_port")
             keyword = cfg.get(section, "keyword", fallback=None)
+            watchdog_timeout = cfg.getint(section, "watchdog_timeout", fallback=600)  # 10 minutes default
+            
+            # Validate watchdog timeout
+            if watchdog_timeout <= 0:
+                logger.warning(f"[{name}] Invalid watchdog_timeout {watchdog_timeout}, using default 600")
+                watchdog_timeout = 600
+            if watchdog_timeout < 60:
+                logger.warning(f"[{name}] watchdog_timeout {watchdog_timeout}s is very aggressive (< 60s)")
             
             # Validate keyword
             if keyword:
@@ -288,7 +392,8 @@ def load_config(file="connections.ini") -> list:
                 "remote_host": remote_host,
                 "remote_port": remote_port,
                 "forward_port": forward_port,
-                "keyword": keyword
+                "keyword": keyword,
+                "watchdog_timeout": watchdog_timeout
             })
             
         except (ValueError, configparser.NoOptionError) as e:
@@ -300,70 +405,72 @@ def load_config(file="connections.ini") -> list:
 def status_monitor(handlers: list, interval: float = 30.0):
     """Print status for all streams periodically - refreshes in place"""
     
-    # Determine terminal size
-    def get_terminal_height():
-        try:
-            return os.get_terminal_size().lines
-        except:
-            return 24  # Default fallback
-    
-    # Initial render
     first_run = True
     
     while True:
-        time.sleep(interval)
-        
-        # Build status output
-        lines = []
-        lines.append("=" * 80)
-        lines.append(f"Status Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append("=" * 80)
-        
-        for handler in handlers:
-            m = handler.fwd.metrics
-            viewers = handler.fwd.viewer_count()
+        try:
+            # Build status output
+            lines = []
+            lines.append("=" * 110)
+            lines.append(f"Status Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append("=" * 110)
             
-            # Connection status
-            if handler.rc.connected:
-                uptime = m.uptime()
-                status = f"UP ({uptime/3600:.1f}h)"
-            else:
-                status = "DOWN"
-            
-            # Last data time
-            delta = m.time_since_data()
-            if delta is not None:
-                if delta < 60:
-                    last_data = f"{delta:.0f}s ago"
-                elif delta < 3600:
-                    last_data = f"{delta/60:.0f}m ago"
+            for handler in handlers:
+                m = handler.fwd.metrics
+                viewers = handler.fwd.viewer_count()
+                
+                # Get metrics under lock
+                with m._lock:
+                    bytes_rx = m.bytes_received
+                    msgs_rx = m.messages_received
+                    uptime = m.uptime()
+                    delta = m.time_since_data()
+                
+                # Connection status
+                if handler.rc.connected:
+                    status = f"UP ({uptime/3600:.1f}h)"
                 else:
-                    last_data = f"{delta/3600:.1f}h ago"
-            else:
-                last_data = "never"
+                    status = "DOWN"
+                
+                # Last data time
+                if delta is not None:
+                    if delta < 60:
+                        last_data = f"{delta:.0f}s ago"
+                    elif delta < 3600:
+                        last_data = f"{delta/60:.0f}m ago"
+                    else:
+                        last_data = f"{delta/3600:.1f}h ago"
+                else:
+                    last_data = "never"
+                
+                # Format output
+                lines.append(f"[{handler.name:15s}] {status:12s} | "
+                            f"Viewers: {viewers:2d} | "
+                            f"Last: {last_data:10s} | "
+                            f"RX: {bytes_rx/1024/1024:8.2f} MB | "
+                            f"Msgs: {msgs_rx:8,d}")
             
-            # Format output
-            lines.append(f"[{handler.name:15s}] {status:12s} | "
-                        f"Viewers: {viewers:2d} | "
-                        f"Last: {last_data:10s} | "
-                        f"RX: {m.bytes_received/1024/1024:8.2f} MB | "
-                        f"Msgs: {m.messages_received:8,d}")
+            lines.append("=" * 110)
+            lines.append("")  # Empty line at end
+            
+            # Print status
+            if first_run:
+                # First time, just print normally
+                print("\n".join(lines))
+                first_run = False
+            else:
+                # Move cursor to top and redraw
+                # ANSI escape: \033[H moves cursor to home (top-left)
+                # \033[J clears from cursor to end of screen
+                sys.stdout.write("\033[H\033[J")
+                sys.stdout.write("\n".join(lines))
+                sys.stdout.flush()
         
-        lines.append("=" * 80)
-        lines.append("")  # Empty line at end
+        except Exception as e:
+            logger.error(f"Error in status_monitor: {e}", exc_info=True)
         
-        # Clear screen and move cursor to top
-        if first_run:
-            # First time, just print normally
-            print("\n".join(lines))
-            first_run = False
-        else:
-            # Move cursor to top and redraw
-            # ANSI escape: \033[H moves cursor to home (top-left)
-            # \033[J clears from cursor to end of screen
-            sys.stdout.write("\033[H\033[J")
-            sys.stdout.write("\n".join(lines))
-            sys.stdout.flush()
+        # Sleep after printing so first report appears immediately
+        time.sleep(interval)
 
 
 def main():
@@ -404,9 +511,10 @@ def main():
                 host=conn["remote_host"],
                 port=conn["remote_port"],
                 magic_keyword=conn["keyword"],
-                keepalive_timeout=300,
+                timeout=2.0,  # 2-second socket timeout for fast disconnection detection
+                keepalive_timeout=120,  # 2 minutes - detect stale connections faster
                 auto_reconnect=True,
-                reconnect_delay=3.0
+                reconnect_delay=1.0  # 1 second - faster recovery when remote comes back
             )
             
             # Create handler (no closures!)
@@ -415,7 +523,7 @@ def main():
                 rc=rc,
                 fwd=fwd,
                 config=conn,
-                watchdog_timeout=21600  # 6 hours
+                watchdog_timeout=conn.get("watchdog_timeout", 600)  # From config, default 10 minutes
             )
             
             handlers.append(handler)
@@ -433,7 +541,7 @@ def main():
     # Start status monitor
     status_thread = threading.Thread(
         target=status_monitor, 
-        args=(handlers,), 
+        args=(handlers, 5.0),  # Update every 5 seconds instead of 30
         daemon=True,
         name="StatusMonitor"
     )
@@ -453,7 +561,7 @@ def main():
     print("\nConnect viewers:")
     for h in handlers:
         print(f"  nc 127.0.0.1 {h.config['forward_port']:5d}  # {h.name}")
-    print("\nStatus updates every 30 seconds")
+    print("\nStatus updates every 5 seconds")
     print(f"Logs: {os.path.abspath('forwarder.log')}")
     print("Press Ctrl+C to shutdown")
     print("="*80)
@@ -472,10 +580,17 @@ def main():
         print("Shutting down gracefully...")
         print("="*80)
         
-        # Stop all handlers
+        # Stop all handlers and connections in correct order:
+        # 1. Stop handlers (stops watchdog, prevents new reconnects)
+        # 2. Disconnect remote connections
+        # 3. Stop forwarding servers
         for handler in handlers:
             handler.stop()
+        
+        for handler in handlers:
             handler.rc.disconnect()
+        
+        for handler in handlers:
             handler.fwd.stop()
         
         logger.info("Clean shutdown complete")
