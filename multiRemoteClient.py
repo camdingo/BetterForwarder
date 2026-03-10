@@ -17,6 +17,7 @@ import socket
 import sys
 import threading
 import time
+import select
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -105,11 +106,11 @@ class ForwardingServer:
                 
                 # Platform-specific keepalive settings
                 if hasattr(socket, 'TCP_KEEPIDLE'):
-                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 20)
                 if hasattr(socket, 'TCP_KEEPINTVL'):
-                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
                 if hasattr(socket, 'TCP_KEEPCNT'):
-                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
 
                 with self.lock:
                     self.clients.add(client)
@@ -130,35 +131,53 @@ class ForwardingServer:
                     break
 
     def broadcast(self, data: bytes):
-        """Broadcast data to all connected viewers"""
+        """Broadcast data to all connected viewers.
+
+        The old implementation called ``sendall`` directly from the receive
+        thread, which allowed one slow/blocked client to stall the entire
+        loop.  Use ``select`` to limit the amount of time spent waiting for a
+        socket to become writable and treat sockets that are not writable
+        within the timeout as dead/slow.
+        """
         if not data:
             return
-        
+
         dead = []
         sent_count = 0
-        
-        # Send to all viewers and collect dead ones
+
         with self.lock:
-            clients_copy = self.clients.copy()
-        
-        for c in clients_copy:
+            clients = list(self.clients)
+
+        # ask the kernel which sockets are writable (1s timeout)
+        try:
+            writable, _, _ = select.select(clients, [], [], 1.0)
+        except Exception as e:
+            # if select itself fails, just fall back to the original loop
+            logger.debug(f"[{self.name}] select failed in broadcast: {e}")
+            writable = clients
+
+        slow = set(clients) - set(writable)
+        if slow:
+            logger.warning(f"[{self.name}] {len(slow)} slow viewer(s) detected, closing")
+            dead.extend(slow)
+
+        for c in writable:
             try:
                 c.sendall(data)
                 sent_count += 1
             except (BrokenPipeError, ConnectionResetError, OSError):
                 dead.append(c)
-                logger.info(f"[{self.name}] Viewer disconnected")
-        
-        # Clean up dead connections
+                logger.info(f"[{self.name}] Viewer disconnected during send")
+
         if dead:
             with self.lock:
                 for d in dead:
                     self.clients.discard(d)
                     try:
                         d.close()
-                    except:
+                    except Exception:
                         pass
-        
+
         # Update metrics - thread safe
         with self.metrics._lock:
             if sent_count > 0:
@@ -166,7 +185,6 @@ class ForwardingServer:
             # Always update bytes_received when we get data to broadcast
             self.metrics.bytes_received += len(data)
             self.metrics.messages_received += 1
-            # Log cumulative total for debugging
             logger.debug(f"[{self.name}] RX: {len(data)} bytes (total: {self.metrics.bytes_received} bytes)")
 
     def viewer_count(self) -> int:
@@ -279,9 +297,16 @@ class StreamHandler:
     def _on_connect(self):
         """Called when connection is established"""
         with self.fwd.metrics._lock:
-            self.fwd.metrics.connect_time = time.time()
+            now = time.time()
+            # delta before we reset so logs show how long we were idle
+            last_delta = None
+            if self.fwd.metrics.last_data_time is not None:
+                last_delta = now - self.fwd.metrics.last_data_time
+            self.fwd.metrics.connect_time = now
             self.fwd.metrics.reconnect_count += 1
-        logger.info(f"[{self.name}] Connected to {self.config['remote_host']}:{self.config['remote_port']}")
+            # clear stale timestamp so watchdog doesn’t immediately fire
+            self.fwd.metrics.last_data_time = now
+        logger.info(f"[{self.name}] Connected to {self.config['remote_host']}:{self.config['remote_port']} (idle {last_delta}s)")
         
         # Start watchdog if not already running
         if self.watchdog_thread is None or not self.watchdog_thread.is_alive():
@@ -297,11 +322,14 @@ class StreamHandler:
         logger.warning(f"[{self.name}] Disconnected: {exc}")
         with self.fwd.metrics._lock:
             self.fwd.metrics.connect_time = None
+            # clear last-data to avoid watchdog confusion on next connect
+            self.fwd.metrics.last_data_time = None
     
     def _on_message(self, data: bytes):
         """Called when data is received"""
         with self.fwd.metrics._lock:
             self.fwd.metrics.last_data_time = time.time()
+        logger.debug(f"[{self.name}] received {len(data)} bytes, forwarding to {self.fwd.viewer_count()} viewers")
         self.fwd.broadcast(data)
     
     def _watchdog(self):

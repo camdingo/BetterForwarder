@@ -222,17 +222,19 @@ class RemoteConnection:
                             logger.error(f"Error in on_message callback: {e}", exc_info=True)
                 
                 except socket.timeout:
-                    # Socket timeout is expected - but too many consecutive ones indicate stale connection
+                    # Socket timeout is expected, but too many consecutive ones mean
+                    # the remote isn't sending anything and the connection may be hung.
                     consecutive_recv_timeouts += 1
                     
-                    # 5 consecutive timeouts = 5+ seconds with no data AND no keepalive response
-                    # Combined with keepalive_timeout (300s), this catches hung connections earlier
+                    # 5 consecutive timeouts ~ 5 seconds with no data AND no
+                    # keepalive reply.  Rather than just log, treat it as a
+                    # stale connection and force a reconnect; this lets us recover
+                    # faster than waiting for the long keepalive timeout.
                     if consecutive_recv_timeouts > 5:
                         idle = time.time() - self._last_receive_time
-                        logger.warning(f"Stale connection detected for {target} ({idle:.0f}s idle, {consecutive_recv_timeouts} timeouts)")
-                        # Don't disconnect yet, let keepalive_timeout handle it
-                        consecutive_recv_timeouts = 0  # Reset counter to avoid spam
-                    
+                        logger.warning(f"Stale connection detected for {target} ({idle:.0f}s idle, {consecutive_recv_timeouts} timeouts), triggering disconnect")
+                        self._handle_disconnect(ConnectionError("Stale connection"))
+                        break
                     continue
                 
                 except (ConnectionResetError, BrokenPipeError, OSError) as e:
@@ -329,6 +331,8 @@ class RemoteConnection:
                 if self.connect():
                     logger.info(f"Reconnected successfully to {target}")
                     break
+                else:
+                    logger.debug(f"Reconnect attempt failed for {target}")
                 
                 # Exponential backoff
                 delay = min(delay * 1.5, self.max_reconnect_delay)
@@ -383,11 +387,11 @@ class RemoteConnection:
                 if self.socket:
                     try:
                         self.socket.shutdown(socket.SHUT_RDWR)
-                    except:
+                    except Exception:
                         pass
                     try:
                         self.socket.close()
-                    except:
+                    except Exception:
                         pass
                     self.socket = None
                 
